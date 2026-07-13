@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+
+# Secrets & local config — every .json is ignored except the example template
+*.json
+!credentials.json.example.json
+custom-ca.pem
+*.asc
+*.pem
+*.crt

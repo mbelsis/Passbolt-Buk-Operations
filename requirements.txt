@@ -1,0 +1,2 @@
+py-passbolt>=0.0.19
+keyring>=23.0
