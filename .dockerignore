@@ -1,0 +1,15 @@
+# Keep secrets and local state out of the build context — nothing here may end
+# up in an image.
+.git
+.venv
+.claude
+__pycache__
+tests
+keys/
+.env
+*.json
+*.asc
+*.pem
+*.crt
+*.key
+app.py

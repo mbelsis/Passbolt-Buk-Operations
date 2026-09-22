@@ -1,0 +1,26 @@
+# Passbolt Bulk Tool — run locally in Docker:   docker compose up -d --build
+# then open http://127.0.0.1:8765
+#
+# Settings come from an optional .env file next to this one (copy .env.example).
+services:
+  passbolt-bulk-tool:
+    build: .
+    image: passbolt-bulk-tool:local
+    container_name: passbolt-bulk-tool
+    ports:
+      # 127.0.0.1 ONLY. The tool has no login of its own: whoever reaches this port
+      # acts with the Passbolt account connected in it. Never publish it as "8765:8765".
+      - "127.0.0.1:8765:8765"
+    environment:
+      PASSBOLT_BASE_URL: ${PASSBOLT_BASE_URL:-}
+      PASSBOLT_USER_ID: ${PASSBOLT_USER_ID:-}
+      # Paths INSIDE the container, i.e. under /keys (the ./keys folder below).
+      PASSBOLT_KEY_FILE: ${PASSBOLT_KEY_FILE:-}
+      PASSBOLT_CA_FILE: ${PASSBOLT_CA_FILE:-}
+    volumes:
+      # Optional: put your private key (.asc) and CA certificate here to skip uploading
+      # them in the page. Read-only; the folder is git-ignored.
+      - ./keys:/keys:ro
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"

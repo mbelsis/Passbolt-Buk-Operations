@@ -6,11 +6,18 @@ Run:  python3 webapp.py        then open  http://127.0.0.1:8765
 Everything runs locally: the page is served on 127.0.0.1 only, your private
 key and passphrase are sent only to this local process, held in memory, and
 used to authenticate against your Passbolt server.
+
+Environment (used by the Docker image; all optional):
+  PASSBOLT_TOOL_HOST / PASSBOLT_TOOL_PORT   listen address (default 127.0.0.1:8765)
+  PASSBOLT_TOOL_OPEN_BROWSER=0             don't try to open a browser
+  PASSBOLT_BASE_URL, PASSBOLT_USER_ID,
+  PASSBOLT_KEY_FILE, PASSBOLT_CA_FILE      override the same fields of credentials.json
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 import traceback
 import webbrowser
@@ -24,8 +31,16 @@ from passbolt_client import (
     PassboltError,
 )
 
-HOST, PORT = "127.0.0.1", 8765
+HOST = os.environ.get("PASSBOLT_TOOL_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PASSBOLT_TOOL_PORT", "8765"))
+OPEN_BROWSER = os.environ.get("PASSBOLT_TOOL_OPEN_BROWSER", "1") != "0"
 CRED_FILE = Path(__file__).parent / "credentials.json"
+ENV_OVERRIDES = {
+    "base_url": "PASSBOLT_BASE_URL",
+    "user_id": "PASSBOLT_USER_ID",
+    "key_file": "PASSBOLT_KEY_FILE",
+    "ca_file": "PASSBOLT_CA_FILE",
+}
 
 _state_lock = threading.Lock()
 _client: PassboltClient | None = None
@@ -33,11 +48,14 @@ _client: PassboltClient | None = None
 
 def _load_defaults() -> tuple[dict, str]:
     """Optional credentials.json: pre-fills the form so the user only types
-    the passphrase. Same file webapp_auto.py uses."""
+    the passphrase. Same file webapp_auto.py uses. PASSBOLT_* environment
+    variables override its fields (the Docker image mounts the key elsewhere)."""
+    defaults: dict = {}
+    error = ""
     if CRED_FILE.exists():
         try:
             raw = CRED_FILE.read_text()
-            return json.loads(raw), ""
+            defaults = json.loads(raw)
         except ValueError as exc:
             error = f"credentials.json is invalid JSON and was IGNORED: {exc}"
             if "\\" in raw:
@@ -46,8 +64,10 @@ def _load_defaults() -> tuple[dict, str]:
                     '"/Users/x/Mobile Documents/…" with plain spaces, no backslashes.'
                 )
             print(error)
-            return {}, error
-    return {}, ""
+    for field, var in ENV_OVERRIDES.items():
+        if os.environ.get(var):
+            defaults[field] = os.environ[var]
+    return defaults, error
 
 
 _defaults, _defaults_error = _load_defaults()
@@ -70,14 +90,20 @@ def api_connect(payload: dict) -> dict:
     elif verify and _defaults.get("ca_file"):
         ca_path = Path(_defaults["ca_file"]).expanduser()
         if not ca_path.exists():
-            raise PassboltError(f"ca_file from credentials.json not found: {ca_path}")
+            raise PassboltError(
+                f"CA file not found: {ca_path} (set as ca_file in credentials.json "
+                "or PASSBOLT_CA_FILE)"
+            )
         verify = str(ca_path)
 
     private_key = payload.get("private_key", "")
     if not private_key and _defaults.get("key_file"):
         key_path = Path(_defaults["key_file"]).expanduser()
         if not key_path.exists():
-            raise PassboltError(f"key_file from credentials.json not found: {key_path}")
+            raise PassboltError(
+                f"Private key file not found: {key_path} (set as key_file in "
+                "credentials.json or PASSBOLT_KEY_FILE) — or choose the key file in the form."
+            )
         private_key = key_path.read_text()
 
     # Normalize to scheme://host[:port] — people paste full web-app URLs
@@ -257,12 +283,26 @@ def api_apply(payload: dict) -> dict:
     return {"lines": lines}
 
 
+def _not_me(permissions: list[dict]) -> list[dict]:
+    """Permissions other than the connected user's own (the creator of a new
+    folder or password is made its owner by the server)."""
+    me = getattr(_client, "user_id", None)
+    return [
+        p for p in permissions or []
+        if not (p.get("aro") == "User" and p.get("aro_foreign_key") == me)
+    ]
+
+
 def api_clone(payload: dict) -> dict:
+    """Recreate a root folder's subtree under a new root folder with the same
+    permissions; optionally copy the passwords inside as well."""
     if _client is None:
         raise PassboltError("Not connected.")
     source_id = payload["source_id"]
     dest_name = payload["dest_name"].strip()
     copy_root_perms = bool(payload.get("copy_root_perms", True))
+    copy_passwords = bool(payload.get("copy_passwords", False))
+    dry_run = bool(payload.get("dry_run", True))
     if not source_id or not dest_name:
         raise PassboltError("A source folder and the new folder name are required.")
 
@@ -279,32 +319,109 @@ def api_clone(payload: dict) -> dict:
     if any(f["name"].lower() == dest_name.lower() for f in children.get(None, [])):
         raise PassboltError(f"A top-level folder named '{dest_name}' already exists.")
 
+    resources_by_folder: dict[str, list[dict]] = {}
+    if copy_passwords:
+        subtree, stack = set(), [source_id]
+        while stack:
+            fid = stack.pop()
+            subtree.add(fid)
+            stack.extend(c["id"] for c in children.get(fid, []))
+        for r in _client.get_resources_with_permissions():
+            if r.get("folder_parent_id") in subtree:
+                resources_by_folder.setdefault(r["folder_parent_id"], []).append(r)
+
     lines: list[str] = []
-    created = failed = 0
+    folders_done = folders_failed = passwords_done = passwords_failed = 0
+    # source folder id → (new folder id, new path); fake ids in a dry run
+    cloned: dict[str, tuple[str, str]] = {}
 
-    dest_root = _client.create_folder(dest_name, None)
-    created += 1
-    if copy_root_perms:
-        n = _client.copy_parent_permissions(by_id[source_id], dest_root["id"])
-        lines.append(f"OK    {dest_name} created ({n} permissions copied from source root)")
-    else:
-        lines.append(f"OK    {dest_name} created")
+    def make_folder(src: dict, name: str, parent_id, path: str, copy_perms: bool):
+        """Create one folder and copy src's permissions onto it. A folder whose
+        permissions fail to copy is still recursed into — it exists."""
+        nonlocal folders_done, folders_failed
+        n = len(_not_me(src.get("permissions"))) if copy_perms else 0
+        if dry_run:
+            lines.append(f"PLAN  create {path} ({n} permissions)")
+            folders_done += 1
+            return f"dry:{src['id']}"
+        try:
+            new_id = _client.create_folder(name, parent_id)["id"]
+        except PassboltError as exc:
+            lines.append(f"FAIL  {path} — {exc} (subtree skipped)")
+            folders_failed += 1
+            return None
+        folders_done += 1
+        if not copy_perms:
+            lines.append(f"OK    {path} created")
+            return new_id
+        try:
+            n = _client.copy_parent_permissions(src, new_id)
+            lines.append(f"OK    {path} ({n} permissions)")
+        except PassboltError as exc:
+            lines.append(f"FAIL  {path} created, but its permissions were NOT copied — {exc}")
+            folders_failed += 1
+        return new_id
 
-    def clone_level(src_parent_id: str, dest_parent_id: str, path: str):
-        nonlocal created, failed
-        for child in children.get(src_parent_id, []):
+    def clone_level(src_id: str, dest_id: str, path: str):
+        cloned[src_id] = (dest_id, path)
+        for child in children.get(src_id, []):
+            child_path = f"{path}/{child['name']}"
+            new_id = make_folder(child, child["name"], dest_id, child_path, True)
+            if new_id is not None:
+                clone_level(child["id"], new_id, child_path)
+
+    root_id = make_folder(by_id[source_id], dest_name, None, dest_name, copy_root_perms)
+    if root_id is not None:
+        clone_level(source_id, root_id, dest_name)
+
+    for src_folder_id, resources in resources_by_folder.items():
+        target = cloned.get(src_folder_id)
+        labelled = []
+        for r in resources:
             try:
-                new_folder = _client.create_folder(child["name"], dest_parent_id)
-                n = _client.copy_parent_permissions(child, new_folder["id"])
-                lines.append(f"OK    {path}/{child['name']} ({n} permissions)")
-                created += 1
-                clone_level(child["id"], new_folder["id"], f"{path}/{child['name']}")
-            except PassboltError as exc:
-                lines.append(f"FAIL  {path}/{child['name']} — {exc} (subtree skipped)")
-                failed += 1
+                labelled.append((_client.read_resource_metadata(r).get("name") or r["id"], r, None))
+            except Exception as exc:
+                labelled.append((f"resource {r['id']}", r, exc))
+        for label, r, error in sorted(labelled, key=lambda t: t[0].lower()):
+            if target is None:
+                lines.append(f"SKIP  password '{label}' — its folder was not cloned")
+                passwords_failed += 1
+                continue
+            dest_id, dest_path = target
+            if error is not None:
+                lines.append(f"FAIL  password '{label}' in {dest_path} — {error}")
+                passwords_failed += 1
+                continue
+            try:
+                perms = r.get("permissions")
+                if perms is None:
+                    perms = _client.get_resource_permissions(r["id"])
+                if dry_run:
+                    lines.append(
+                        f"PLAN  copy password '{label}' → {dest_path} "
+                        f"({len(_not_me(perms))} permissions)"
+                    )
+                else:
+                    _, granted = _client.clone_resource(r, dest_id, perms)
+                    lines.append(f"OK    password '{label}' → {dest_path} ({granted} permissions)")
+                passwords_done += 1
+            except Exception as exc:
+                lines.append(f"FAIL  password '{label}' in {dest_path} — {exc}")
+                passwords_failed += 1
 
-    clone_level(source_id, dest_root["id"], dest_name)
-    lines.append(f"Done: {created} folders created, {failed} failed. Passwords were not touched.")
+    verb = "planned" if dry_run else "created"
+    summary = f"{folders_done} folders"
+    if copy_passwords:
+        summary += f" + {passwords_done} passwords"
+    lines.append(
+        f"{'DRY RUN — nothing changed. ' if dry_run else ''}"
+        f"Done: {summary} {verb}, {folders_failed + passwords_failed} failed."
+        + ("" if copy_passwords else " Passwords were not touched.")
+    )
+    lines.append(
+        "Note: you are owner of every copy (Passbolt makes the creator owner), "
+        "even where you had less access on the original."
+    )
     return {"lines": lines}
 
 
@@ -775,6 +892,20 @@ PAGE = r"""<!DOCTYPE html>
   code { background: var(--accent-soft); border-radius: 4px; padding: 1px 5px;
     font-size: 12px; }
   .grouprow { font-weight: 600; }
+  .hint { position: relative; display: inline-flex; align-items: center;
+    justify-content: center; width: 17px; height: 17px; border-radius: 50%;
+    border: 1px solid var(--border); background: var(--accent-soft); color: var(--accent);
+    font-size: 11px; font-weight: 700; cursor: help; user-select: none; }
+  .hint:hover, .hint:focus { border-color: var(--accent); outline: none; }
+  .hint-body { display: none; position: absolute; top: calc(100% + 8px); left: -12px;
+    z-index: 20; width: min(360px, 80vw); padding: 12px 14px; border-radius: 10px;
+    background: var(--card); color: var(--text); border: 1px solid var(--border);
+    box-shadow: var(--shadow); font-size: 13px; font-weight: 400; line-height: 1.5;
+    cursor: auto; user-select: text; white-space: normal; }
+  .hint-body > b:first-child { display: block; margin-bottom: 4px; }
+  .hint-body ol { margin: 6px 0; padding-left: 20px; }
+  .hint-body code { overflow-wrap: anywhere; }
+  .hint:hover .hint-body, .hint:focus .hint-body, .hint:focus-within .hint-body { display: block; }
   input[type=checkbox], input[type=radio] { accent-color: var(--accent);
     width: 15px; height: 15px; }
   button { padding: 8px 16px; border: 1px solid transparent; border-radius: 8px;
@@ -849,7 +980,26 @@ PAGE = r"""<!DOCTYPE html>
       <select id="c_backend"><option>PGPy</option><option>gnupg</option></select>
     </label>
     <label>Fingerprint (gnupg only) <input type="text" id="c_fpr" style="min-width:170px"></label>
-    <label>Your User ID (JWT servers) <input type="text" id="c_uid" style="min-width:280px"
+    <label>Your User ID (JWT servers)
+      <span class="hint" tabindex="0" aria-label="Where do I find my User ID?">?
+        <span class="hint-body" role="tooltip">
+          <b>Where do I find my User ID?</b>
+          Only needed if your server uses JWT login (typical for Passbolt 5). Leave it
+          empty otherwise — if it is needed, Connect tells you.
+          <ol>
+            <li>Sign in to Passbolt in your browser as usual.</li>
+            <li>Open <b>Users</b> in the top menu.</li>
+            <li>Click <b>your own name</b> in the list.</li>
+            <li>Look at the browser address bar: it ends in
+              <code>/app/users/view/<i>your-user-id</i></code>.</li>
+            <li>Copy that last part — it looks like
+              <code>8bb80df5-700c-48ce-b568-85a60fc3c8f2</code> — and paste it here.</li>
+          </ol>
+          It is remembered after the first successful connect. To pre-fill it for
+          good, put it in <code>credentials.json</code> as <code>"user_id"</code>.
+        </span>
+      </span>
+      <input type="text" id="c_uid" style="min-width:280px"
            placeholder="uuid from /app/users/view/…"></label>
     <label><input type="checkbox" id="c_verify" checked> Verify TLS</label>
     <label>CA cert, optional (.pem/.crt) <input type="file" id="c_ca" accept=".pem,.crt,.cer,.txt"></label>
@@ -922,9 +1072,17 @@ PAGE = r"""<!DOCTYPE html>
     <label><input type="checkbox" id="cl_rootperms" checked>
       Also copy the source root folder's own permissions onto the new root</label>
   </div>
+  <div class="rowgap">
+    <label><input type="checkbox" id="cl_passwords">
+      Also copy the passwords inside, shared with the same users and groups</label>
+    <label><input type="checkbox" id="cl_dry" checked> Dry run (preview, change nothing)</label>
+  </div>
   <p class="muted">Creates a new top-level folder and recreates the source's complete
   subfolder tree inside it, copying each subfolder's access rights (users and groups,
-  same permission levels). Passwords are <b>not</b> copied or moved.</p>
+  same permission levels). Passwords are copied only when ticked: each one becomes an
+  <b>independent duplicate</b> in the matching new folder, shared with the same people at
+  the same levels — changing the original later does not change the copy. The originals
+  are never moved or modified.</p>
   <div class="rowgap"><button id="btnClone" onclick="doClone()" disabled>Clone structure</button></div>
 </div>
 
@@ -1041,9 +1199,9 @@ if (CA_TEXT) log("CA certificate restored from previous session.");
       if (DEFAULTS.user_id) document.getElementById("c_uid").value = DEFAULTS.user_id;
       if (DEFAULTS.gpg_library) document.getElementById("c_backend").value = DEFAULTS.gpg_library;
       if (DEFAULTS.fingerprint) document.getElementById("c_fpr").value = DEFAULTS.fingerprint;
-      if (DEFAULTS.key_file) log("Private key: from credentials.json (" + DEFAULTS.key_file + ") — no file to choose.");
-      if (DEFAULTS.ca_file) log("CA certificate: from credentials.json (" + DEFAULTS.ca_file + ")");
-      log("Defaults loaded from credentials.json — type your passphrase and press Connect.", "ok");
+      if (DEFAULTS.key_file) log("Private key: preconfigured (" + DEFAULTS.key_file + ") — no file to choose.");
+      if (DEFAULTS.ca_file) log("CA certificate: preconfigured (" + DEFAULTS.ca_file + ")");
+      log("Settings pre-filled (credentials.json or Docker .env) — type your passphrase and press Connect.", "ok");
       document.getElementById("c_pass").focus();
     }
     if (s.connected) {
@@ -1350,18 +1508,27 @@ async function doClone() {
   const destName = document.getElementById("cl_dest").value.trim();
   if (!sourceId) { log("Pick a source root folder.", "err"); return; }
   if (!destName) { log("Enter the new root folder name.", "err"); return; }
-  if (!confirm(`Clone the structure of '${sourceName}' (${countSubtree(sourceId)} subfolders) ` +
-               `into a new root folder '${destName}'?\nPasswords are not copied.`)) return;
+  const copyPasswords = document.getElementById("cl_passwords").checked;
+  const dry = document.getElementById("cl_dry").checked;
+  if (!dry && !confirm(
+      `Clone the structure of '${sourceName}' (${countSubtree(sourceId)} subfolders) ` +
+      `into a new root folder '${destName}'?\n` +
+      (copyPasswords
+        ? "Every password inside will be DUPLICATED and shared with the same people."
+        : "Passwords are not copied.") +
+      "\nTip: run it as a dry run first.")) return;
   const btn = document.getElementById("btnClone");
   btn.disabled = true;
-  log(`Cloning '${sourceName}' → '${destName}' …`);
+  log(`${dry ? "Clone dry run" : "Cloning"} '${sourceName}' → '${destName}'` +
+      (copyPasswords ? " with passwords" : "") + " …");
   try {
     const r = await api("/api/clone", {
       source_id: sourceId, dest_name: destName,
       copy_root_perms: document.getElementById("cl_rootperms").checked,
+      copy_passwords: copyPasswords, dry_run: dry,
     });
-    r.lines.forEach(l => log(l, l.startsWith("FAIL") ? "err" : ""));
-    await loadData();
+    r.lines.forEach(l => log(l, l.startsWith("FAIL") ? "err" : l.startsWith("PLAN") ? "muted" : ""));
+    if (!dry) await loadData();
   } catch (e) { log("ERROR: " + e.message, "err"); }
   finally { btn.disabled = false; }
 }
@@ -1546,8 +1713,13 @@ def main():
     if server is None:
         raise SystemExit(f"No free port found in {PORT}-{PORT + 19}.")
     url = f"http://{HOST}:{server.server_address[1]}"
-    print(f"Passbolt Bulk Tool running at {url}  (Ctrl-C to stop)")
-    threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+    if HOST == "0.0.0.0":  # inside Docker: the host reaches it via the published port
+        print(f"Passbolt Bulk Tool listening on port {server.server_address[1]} — open "
+              "http://127.0.0.1:8765 on your machine (Ctrl-C to stop)")
+    else:
+        print(f"Passbolt Bulk Tool running at {url}  (Ctrl-C to stop)")
+    if OPEN_BROWSER:
+        threading.Timer(0.7, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

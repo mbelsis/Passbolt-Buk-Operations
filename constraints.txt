@@ -1,0 +1,12 @@
+# Versions the tool is tested with. PGPy 0.6 is sensitive to newer cryptography
+# releases, so the Docker image installs exactly these.
+#   pip install -r requirements.txt -c constraints.txt
+py-passbolt==0.0.19
+PGPy==0.6.0
+cryptography==49.0.0
+httpx==0.26.0
+httpcore==1.0.9
+python-gnupg==0.5.2
+pyotp==2.9.0
+pyasn1==0.6.4
+keyring==25.7.0

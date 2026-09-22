@@ -14,12 +14,15 @@ Permission types (Passbolt API):
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from typing import Optional
 from urllib.parse import unquote
 
+import httpx
 from passbolt import PassboltAPI
+from pgpy import PGPKey, PGPMessage
 
 PERMISSION_READ = 1
 PERMISSION_UPDATE = 7
@@ -51,6 +54,43 @@ def _check(response, action: str):
     raise PassboltError(f"{action} failed (HTTP {response.status_code}): {message}")
 
 
+class _JwtAuth(httpx.Auth):
+    """Bearer auth that survives token expiry.
+
+    Passbolt JWT access tokens are short-lived. On a 401 the token is renewed
+    (or, failing that, a fresh login is done with the key) and the request is
+    sent once more. A second 401 is returned to the caller as-is.
+    """
+
+    def __init__(self, client: "PassboltClient"):
+        self._client = client
+        self._lock = threading.Lock()
+
+    def sync_auth_flow(self, request):
+        sent_with = self._client._jwt_access_token
+        request.headers["Authorization"] = f"Bearer {sent_with}"
+        response = yield request
+        if response.status_code != 401:
+            return
+        with self._lock:
+            self._client._renew_jwt(sent_with)
+        request.headers["Authorization"] = f"Bearer {self._client._jwt_access_token}"
+        yield request
+
+
+def _cookie(jar: httpx.Cookies, name: str) -> Optional[str]:
+    """Latest cookie value by name; tolerates the same name on several paths."""
+    values = [c.value for c in jar.jar if c.name == name]
+    return values[-1] if values else None
+
+
+def _as_text(value) -> str:
+    """PGPy returns str or bytearray, python-gnupg a Crypt object."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode()
+    return str(value)
+
+
 class PassboltClient(PassboltAPI):
     """PassboltAPI + folder CRUD and folder permission (share) management.
 
@@ -72,7 +112,7 @@ class PassboltClient(PassboltAPI):
 
     def _get_server_verify(self) -> dict:
         """Validate the base URL and fetch the server's public OpenPGP key."""
-        response = self.session.get(f"{self.base_url}/auth/verify.json")
+        response = self.session.get(f"{self.base_url}/auth/verify.json", auth=None)
         try:
             body = json.loads(response.text)["body"]
         except (ValueError, KeyError):
@@ -144,6 +184,7 @@ class PassboltClient(PassboltAPI):
         response = self.session.post(
             f"{self.base_url}/auth/jwt/login.json",
             json={"user_id": user_id, "challenge": str(armored)},
+            auth=None,
         )
         try:
             decoded = json.loads(response.text)
@@ -165,9 +206,44 @@ class PassboltClient(PassboltAPI):
         tokens = json.loads(str(reply))
         if tokens.get("verify_token") != challenge["verify_token"]:
             raise PassboltError("JWT login: server returned a mismatched verify token.")
-        self.session.headers.update({"Authorization": f"Bearer {tokens['access_token']}"})
+        self._jwt_access_token = tokens["access_token"]
+        self._jwt_refresh_token = tokens.get("refresh_token")
+        if not isinstance(self.session.auth, _JwtAuth):
+            self.session.auth = _JwtAuth(self)
         self.user_id = user_id
         self.authenticated = True
+
+    def _renew_jwt(self, expired_token: str):
+        """Called on a 401: refresh the access token, else log in again.
+
+        Refresh tokens are single-use; the server returns the next one as a
+        cookie. Raises PassboltError when neither works (reconnect needed).
+        """
+        if self._jwt_access_token != expired_token:
+            return  # another request already renewed it
+        if self._jwt_refresh_token:
+            response = self.session.post(
+                f"{self.base_url}/auth/jwt/refresh.json",
+                json={"user_id": self.user_id, "refresh_token": self._jwt_refresh_token},
+                auth=None,
+            )
+            try:
+                body = json.loads(response.text).get("body") or {}
+            except ValueError:
+                body = {}
+            if response.status_code == 200 and body.get("access_token"):
+                self._jwt_access_token = body["access_token"]
+                self._jwt_refresh_token = body.get("refresh_token") or _cookie(
+                    self.session.cookies, "refresh_token"
+                )
+                return
+        try:
+            self._jwt_login(self._get_server_verify())
+        except Exception as exc:
+            raise PassboltError(
+                f"Your Passbolt session expired and could not be renewed ({exc}) — "
+                "reconnect."
+            ) from exc
 
     # ------------------------------------------------------------------ #
     # Folders
@@ -297,6 +373,189 @@ class PassboltClient(PassboltAPI):
         if new_perms:
             self.share_folder(new_folder_id, new_perms)
         return len(new_perms)
+
+    # ------------------------------------------------------------------ #
+    # Resources (passwords) — used only by the opt-in "copy passwords" clone
+    # ------------------------------------------------------------------ #
+
+    def get_resources_with_permissions(self) -> list[dict]:
+        """All resources visible to the user, each with its permission list."""
+        response = self.session.get(
+            f"{self.base_url}/resources.json", params={"contain[permissions]": "1"}
+        )
+        return _check(response, "List resources")["body"]
+
+    def get_resource_permissions(self, resource_id: str) -> list[dict]:
+        response = self.session.get(f"{self.base_url}/permissions/resource/{resource_id}.json")
+        return _check(response, f"Read permissions of resource {resource_id}")["body"]
+
+    def decrypt_secret(self, resource_id: str) -> str:
+        response = self.session.get(f"{self.base_url}/secrets/resource/{resource_id}.json")
+        data = _check(response, f"Read secret of resource {resource_id}")["body"]["data"]
+        return _as_text(self.decrypt(data))
+
+    def gpgkey_of(self, user_id: str) -> dict:
+        """A user's public key record (armored_key, fingerprint, id), cached."""
+        cache = self.__dict__.setdefault("_gpgkey_cache", {})
+        if user_id not in cache:
+            response = self.session.get(f"{self.base_url}/users/{user_id}.json")
+            cache[user_id] = _check(response, f"Read public key of user {user_id}")["body"]["gpgkey"]
+        return cache[user_id]
+
+    def _metadata_keys(self) -> dict[str, dict]:
+        """Shared metadata keys (Passbolt v5 encrypted metadata), loaded once.
+
+        id → {"id", "armored_key", "fingerprint", "expired",
+              "private": (PGPKey, passphrase) or None}
+        "private" is None when the key was never shared with this account.
+        """
+        cached = self.__dict__.get("_metadata_key_cache")
+        if cached is not None:
+            return cached
+        response = self.session.get(
+            f"{self.base_url}/metadata/keys.json",
+            params={"contain[metadata_private_keys]": "1", "filter[deleted]": "0"},
+        )
+        keys = [] if response.status_code == 404 else _check(response, "List metadata keys")["body"]
+        cache: dict[str, dict] = {}
+        for key in keys:
+            private = None
+            for entry in key.get("metadata_private_keys") or []:
+                # Entries with user_id null are encrypted for the server, not for us.
+                if entry.get("user_id") == self.user_id and entry.get("data"):
+                    decoded = json.loads(_as_text(self.decrypt(entry["data"])))
+                    pgp_key, _ = PGPKey.from_blob(decoded["armored_key"])
+                    private = (pgp_key, decoded.get("passphrase") or "")
+            cache[key["id"]] = {
+                "id": key["id"],
+                "armored_key": key["armored_key"],
+                "fingerprint": key.get("fingerprint", ""),
+                "expired": key.get("expired"),
+                "private": private,
+            }
+        self._metadata_key_cache = cache
+        return cache
+
+    @staticmethod
+    def _decrypt_with(private: tuple, message: str) -> str:
+        pgp_key, passphrase = private
+        pgp_message = PGPMessage.from_blob(message)
+        if pgp_key.is_protected:
+            with pgp_key.unlock(passphrase):
+                return _as_text(pgp_key.decrypt(pgp_message).message)
+        return _as_text(pgp_key.decrypt(pgp_message).message)
+
+    def read_resource_metadata(self, resource: dict) -> dict:
+        """Cleartext metadata: v4 fields as they are, v5 metadata decrypted."""
+        if not resource.get("metadata"):
+            return {f: resource.get(f) for f in ("name", "username", "uri", "description")}
+        if resource.get("metadata_key_type") == "user_key":
+            return json.loads(_as_text(self.decrypt(resource["metadata"])))
+        key = self._metadata_keys().get(resource.get("metadata_key_id"))
+        if key is None or key["private"] is None:
+            raise PassboltError(
+                "the shared metadata key of this password is not available to your "
+                "account — an administrator must share it with you in Passbolt first"
+            )
+        return json.loads(self._decrypt_with(key["private"], resource["metadata"]))
+
+    def _metadata_key_for_new_resource(self, preferred_id: Optional[str]) -> Optional[dict]:
+        active = [k for k in self._metadata_keys().values() if not k.get("expired")]
+        for key in active:
+            if key["id"] == preferred_id:
+                return key
+        return active[0] if active else None
+
+    def clone_resource(
+        self, resource: dict, dest_folder_id: str, permissions: list[dict]
+    ) -> tuple[str, int]:
+        """Create an independent copy of a password inside dest_folder_id and
+        share it with the same users and groups at the same levels.
+
+        The secret is decrypted locally, re-encrypted for the creator on
+        creation, then for every user the share adds (group members expanded
+        by the server's share simulation). If sharing fails, the unshared copy
+        is deleted again, so a failure never leaves a stray duplicate.
+        Returns (new resource id, number of permissions granted).
+        """
+        secret = self.decrypt_secret(resource["id"])
+        me = self.gpgkey_of(self.user_id)
+        others = [
+            p for p in permissions
+            if not (p.get("aro") == "User" and p.get("aro_foreign_key") == self.user_id)
+        ]
+
+        payload = {
+            "resource_type_id": resource["resource_type_id"],
+            "folder_parent_id": dest_folder_id,
+            "secrets": [{"data": self.encrypt(secret, me)}],
+        }
+        if resource.get("expired"):
+            payload["expired"] = resource["expired"]
+        if resource.get("metadata"):
+            metadata = json.dumps(self.read_resource_metadata(resource))
+            key = self._metadata_key_for_new_resource(resource.get("metadata_key_id"))
+            if key is not None:
+                payload.update(
+                    metadata=self.encrypt(metadata, key),
+                    metadata_key_id=key["id"],
+                    metadata_key_type="shared_key",
+                )
+            elif not others:
+                payload.update(
+                    metadata=self.encrypt(metadata, me),
+                    metadata_key_id=me["id"],
+                    metadata_key_type="user_key",
+                )
+            else:
+                raise PassboltError("no active shared metadata key to encrypt the copy for sharing")
+        else:
+            for field in ("name", "username", "uri", "description"):
+                payload[field] = resource.get(field)
+
+        response = self.session.post(f"{self.base_url}/resources.json", json=payload)
+        new_id = _check(response, "Create password copy")["body"]["id"]
+        if not others:
+            return new_id, 0
+
+        changes = [
+            {
+                "is_new": True,
+                "aro": p["aro"],
+                "aro_foreign_key": p["aro_foreign_key"],
+                "aco": "Resource",
+                "aco_foreign_key": new_id,
+                "type": p["type"],
+            }
+            for p in others
+        ]
+        try:
+            response = self.session.post(
+                f"{self.base_url}/share/simulate/resource/{new_id}.json",
+                json={"permissions": changes},
+            )
+            simulated = _check(response, "Simulate sharing of the copy")["body"]
+            added = [
+                entry["User"]["id"]
+                for entry in (simulated.get("changes") or {}).get("added") or []
+            ]
+            secrets = [
+                {"user_id": uid, "data": self.encrypt(secret, self.gpgkey_of(uid))}
+                for uid in added
+                if uid != self.user_id
+            ]
+            response = self.session.put(
+                f"{self.base_url}/share/resource/{new_id}.json",
+                json={"permissions": changes, "secrets": secrets},
+            )
+            _check(response, "Share the copy")
+        except Exception as exc:
+            try:
+                self.session.delete(f"{self.base_url}/resources/{new_id}.json")
+            except Exception:
+                pass
+            raise PassboltError(f"{exc} — the unshared copy was removed again") from exc
+        return new_id, len(changes)
 
     # ------------------------------------------------------------------ #
     # Convenience

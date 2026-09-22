@@ -9,3 +9,7 @@ custom-ca.pem
 *.asc
 *.pem
 *.crt
+
+# Docker: local settings and mounted keys
+.env
+keys/

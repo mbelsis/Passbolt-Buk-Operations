@@ -5,8 +5,9 @@ against a [Passbolt](https://www.passbolt.com) server — the operations that ar
 painfully slow to do one-by-one in the Passbolt web interface.
 
 It runs entirely on your machine (`127.0.0.1` only), talks to your Passbolt server with
-your own account and OpenPGP key, and **never reads, copies, or re-shares passwords** —
-every operation works on folders and their access rights only.
+your own account and OpenPGP key. Every operation works on folders and their access
+rights only — it **never reads, copies, or re-shares passwords**, with one opt-in
+exception: *Also copy the passwords inside* on **Clone structure** (off by default).
 
 ---
 
@@ -39,7 +40,22 @@ Pick a source root folder and a name for a **new** root folder: the source's com
 subfolder tree is recreated inside it, and each cloned subfolder receives **the same
 access rights** (users and groups, same levels) as its original. Optionally the source
 root's own permissions are copied onto the new root as well. Ideal for standing up a new
-environment (e.g. a DR copy of the PRD tree). Passwords are not copied or moved.
+environment (e.g. a DR copy of the PRD tree).
+- *Also copy the passwords inside* (off by default): every password in the source tree is
+  duplicated into the matching new folder and shared with **the same users and groups at
+  the same levels**. The secret is decrypted locally with your key and re-encrypted for
+  each person who gets access (group members included); Passbolt v5 encrypted metadata is
+  re-encrypted with the shared metadata key. Copies are **independent** — changing the
+  original later does not change the copy. The originals are never moved or modified.
+  You can only copy passwords you can decrypt, and on v5 the shared metadata key must
+  have been shared with your account.
+- *Dry run* (on by default) prints the plan — every folder and password with its number
+  of permissions — without creating anything and without reading any secret.
+- A subfolder whose permissions fail to copy is still created and cloned into, with a
+  `FAIL` line saying its permissions were not copied. A password whose sharing fails is
+  deleted again, so no unshared duplicate is left behind.
+- You become **owner of every copy** (Passbolt makes the creator owner), even where you
+  had less access on the original.
 
 ### 4 · CSV import
 Build a whole structure — with optional per-folder access — from a spreadsheet:
@@ -82,7 +98,21 @@ compliance snapshot. Use the search box + dropdown to filter to a single user or
 
 ---
 
-## Two ways to run it
+## Choose how to install it: Python or Docker
+
+Both run **the same tool on your own machine only** (`127.0.0.1`) — pick whichever is
+easier for you. Neither is a server for other people: the tool has no login of its own.
+
+| | **Option A · Python** | **Option B · Docker** |
+|---|---|---|
+| You need | Python 3.9+ | Docker Desktop (or Docker Engine) |
+| Install | `venv` + `pip install` ([below](#installation-once--option-a--python)) | `docker compose up -d --build` ([below](#option-b--docker)) |
+| Pinned, tested library versions | You manage the venv | Built in (`constraints.txt`) |
+| Auto-connect (`webapp_auto.py`, passphrase from Keychain) | ✅ | — (type the passphrase in the page) |
+| Opens the browser for you | ✅ | — (open http://127.0.0.1:8765) |
+| Private key | Chosen in the page, or `key_file` in `credentials.json` | Chosen in the page, or placed in `./keys` |
+
+## Two ways to connect (Option A · Python)
 
 Both entry points serve **the exact same application** — same six tabs, same features,
 same engine (`webapp_auto.py` simply imports `webapp.py`). They differ **only in how you
@@ -123,6 +153,13 @@ Python packages (installed below): `py-passbolt`, `keyring`.
   fallback to JWT (v5+). JWT servers additionally need your **User ID** (UUID): in the
   Passbolt web app go to *Users → click your own name* — the URL ends in
   `/app/users/view/<your-user-id>`.
+- **JWT sessions renew themselves**: access tokens are short-lived, so when the server
+  answers 401 the tool uses the refresh token (single-use; the next one arrives as a
+  cookie) and retries the request. If the refresh is refused it logs in again with your
+  key; only if that also fails does the operation stop with *"session expired … —
+  reconnect"*. Long runs (e.g. cloning a large tree with passwords) are not cut off.
+- **Passbolt v5 encrypted metadata** is supported where the tool reads password names
+  (Clone with passwords). v5 *encrypted folders* (off by default in Passbolt 5) are not.
 - Accounts with **enforced MFA** may be refused API login — use an account without MFA
   enforcement or a dedicated automation user.
 - Passbolt has **no API keys** by design (end-to-end encryption: the key *is* the
@@ -130,7 +167,7 @@ Python packages (installed below): `py-passbolt`, `keyring`.
 
 ---
 
-## Installation (once)
+## Installation (once) — Option A · Python
 
 ```bash
 cd passbolt-bulk-tool
@@ -164,7 +201,7 @@ cp credentials.json.example.json credentials.json
 | `base_url` | Your Passbolt server. A full web-app URL also works — the path is stripped. |
 | `key_file` | Path to your `.asc` private key (`~` is expanded; plain spaces, **no backslash escaping** — this is JSON, not shell). |
 | `ca_file` | Path to your CA certificate, or `""` for a publicly trusted cert. |
-| `user_id` | Your UUID — only needed on JWT (v5+) servers, else `""`. |
+| `user_id` | Your UUID — only needed on JWT (v5+) servers, else `""`. Hover the **?** next to *Your User ID* in the page for where to find it (Passbolt → *Users* → click your own name → the address bar ends in `/app/users/view/<your-user-id>`). |
 | `gpg_library` | `PGPy` (default). `gnupg` only for exotic keys — needs GnuPG installed, key imported, and `fingerprint` filled. |
 | `verify` | `true` = verify TLS (recommended). |
 
@@ -190,6 +227,47 @@ python webapp_auto.py   # auto-connect mode — opens the UI already authenticat
 
 If port 8765 is busy the tool picks the next free port and prints the URL.
 
+## Option B · Docker
+
+The image contains only the tool's code — never a key, passphrase, certificate or
+`credentials.json` (`.dockerignore` keeps them out of the build). It runs as a non-root
+user and is published on **127.0.0.1 only**.
+
+```bash
+cd passbolt-bulk-tool
+cp .env.example .env        # optional: pre-fill server URL, User ID, key and CA paths
+docker compose up -d --build
+```
+
+Open **http://127.0.0.1:8765**, type your passphrase and press **Connect**.
+
+- **Private key / CA certificate** — either choose them in the Connection form, or copy
+  them into a `keys/` folder next to `docker-compose.yml` (git-ignored, mounted
+  read-only) and set the paths *as seen inside the container* in `.env`:
+  `PASSBOLT_KEY_FILE=/keys/passbolt-recovery-kit.asc`, `PASSBOLT_CA_FILE=/keys/company-ca.pem`.
+- **Server URL and User ID** — `PASSBOLT_BASE_URL` and `PASSBOLT_USER_ID` in `.env`, or
+  type them in the form.
+- The **passphrase** is always typed in the page; it is never put in `.env` or the image.
+- Stop it with `docker compose down`; update after pulling new code with
+  `docker compose up -d --build`.
+
+> ⚠️ Keep the port mapping as `127.0.0.1:8765:8765`. Publishing it as `8765:8765` exposes
+> the tool — and whichever Passbolt account is connected in it — to your whole network.
+
+Without Compose:
+
+```bash
+docker build -t passbolt-bulk-tool:local .
+docker run --rm -p 127.0.0.1:8765:8765 passbolt-bulk-tool:local
+```
+
+Run the test suite inside the image:
+
+```bash
+docker run --rm -v "$PWD/tests:/app/tests:ro" passbolt-bulk-tool:local \
+  python -m unittest discover -s tests -v
+```
+
 ---
 
 ## Security notes
@@ -206,10 +284,12 @@ If port 8765 is busy the tool picks the next free port and prints the URL.
 - The Passbolt **server never cascades permissions** — the browser extension does it
   client-side. This tool replicates that: *inherit parent permissions* on creation, and
   *apply to subfolders* on grants.
-- All operations are **folder-only**. Passwords already inside a folder keep their
-  current sharing (re-sharing a resource requires re-encrypting its secret per user —
-  deliberately out of scope). Resources added later via the web UI pick up folder
-  permissions on creation.
+- All operations are **folder-only**, except the opt-in password copy of Clone structure.
+  Passwords already inside a folder keep their current sharing (re-sharing an existing
+  resource requires re-encrypting its secret per user — out of scope). Resources added
+  later via the web UI pick up folder permissions on creation.
+- Copying passwords reads every secret in the source tree. If your Passbolt server
+  records action logs, each copy shows up there as a secret access by your account.
 - Permission levels: *can read* = 1, *can update* = 7, *owner* = 15.
 
 ## Troubleshooting
@@ -222,7 +302,9 @@ If port 8765 is busy the tool picks the next free port and prints the URL.
 | `This server uses JWT authentication…` | Fill in your User ID (see compatibility above). |
 | `credentials.json is invalid JSON and was IGNORED` | Usually backslash-escaped paths — write plain spaces. |
 | Empty grey window from `app.py` | macOS system Tk 8.5 is broken — use `webapp.py`. |
-| Port in use | The tool picks the next free port automatically and prints the URL. |
+| Port in use | The tool picks the next free port automatically and prints the URL. In Docker, change the left side of the mapping, e.g. `127.0.0.1:8766:8765`. |
+| Docker: `Private key file not found: /keys/…` | The file isn't in `./keys`, or `PASSBOLT_KEY_FILE` uses the host path — use the path inside the container (`/keys/<file>`), or choose the key in the form. |
+| Docker: server name doesn't resolve / connection refused | The container uses Docker's DNS. On a VPN, check `docker run --rm passbolt-bulk-tool:local python -c "import socket; print(socket.gethostbyname('your-passbolt-host'))"`; if it fails, add the host under `extra_hosts:` in `docker-compose.yml`. |
 
 ## Files
 
@@ -230,8 +312,15 @@ If port 8765 is busy the tool picks the next free port and prints the URL.
 - `webapp_auto.py` — same UI, auto-connects from `credentials.json` + OS credential store
 - `passbolt_client.py` — API client: [py-passbolt](https://github.com/passbolt/lab-passbolt-py)
   extended with folder CRUD, `/share/folder` permission management, move/rename/delete,
-  and JWT auth fallback
-- `credentials.json.example.json` — configuration template
+  JWT auth fallback, and password copying (secret re-encryption, `/share/resource`,
+  v5 metadata keys)
+- `tests/` — run with `.venv/bin/python -m unittest discover -s tests -v`; a fake
+  Passbolt server with real PGP keys:
+  - `test_clone.py` — Clone structure, including password copies (v4 and v5 metadata)
+  - `test_jwt_session.py` — JWT login fallback, token refresh, re-login, "reconnect" error
+- `credentials.json.example.json` — configuration template (Option A)
+- `Dockerfile`, `docker-compose.yml`, `.env.example`, `.dockerignore` — Option B
+- `requirements.txt` + `constraints.txt` — dependencies and the exact tested versions
 - `app.py` — legacy Tkinter desktop UI (requires Tk 8.6+; not usable with macOS system Python)
 - `LICENSE.md` — license terms
 
