@@ -171,6 +171,15 @@ class PassboltClient(PassboltAPI):
                 "Passbolt web app: Users → click your own name → the browser URL "
                 "ends in /app/users/view/<your-user-id>. Enter it and reconnect."
             )
+        try:
+            uuid.UUID(user_id)
+        except ValueError:
+            raise PassboltError(
+                f"User ID {user_id!r} is not a valid UUID — it looks like "
+                "8bb80df5-700c-48ce-b568-85a60fc3c8f2. Find it in the Passbolt web app: "
+                "Users → click your own name → the browser URL ends in "
+                "/app/users/view/<your-user-id>."
+            )
         challenge = {
             "version": "1.0.0",
             "domain": self.base_url,
@@ -195,9 +204,12 @@ class PassboltClient(PassboltAPI):
             )
         if response.status_code != 200:
             message = decoded.get("header", {}).get("message", "")
+            details = decoded.get("body")
+            if details:
+                message = f"{message} {json.dumps(details)[:300]}"
             raise PassboltError(
-                f"JWT login failed (HTTP {response.status_code}): {message} "
-                f"{json.dumps(decoded.get('body'))[:300]}"
+                f"JWT login failed (HTTP {response.status_code}): {message} — check that "
+                "the User ID is yours and that this private key belongs to that account."
             )
         encrypted_reply = decoded["body"]["challenge"]
         reply = self.decrypt(encrypted_reply)

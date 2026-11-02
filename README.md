@@ -296,6 +296,7 @@ docker run --rm -v "$PWD/tests:/app/tests:ro" passbolt-bulk-tool:local \
 
 | Symptom | Cause / fix |
 |---|---|
+| Connect fails | The reason appears in red right under the Connect button (and in the log pane). |
 | `CERTIFICATE_VERIFY_FAILED` | Internal CA / TLS-inspection proxy — provide the CA cert (form field or `ca_file`). |
 | `did not return Passbolt JSON` | Wrong base URL — check the hostname. |
 | `Wrong key passphrase` | Exactly that — retype it. |

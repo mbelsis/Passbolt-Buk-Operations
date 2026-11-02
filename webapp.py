@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import threading
 import traceback
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import httpx
+from pgpy import PGPKey
 
 from passbolt_client import (
     PERMISSION_LABELS,
@@ -77,6 +81,53 @@ _defaults, _defaults_error = _load_defaults()
 # API operations
 # --------------------------------------------------------------------------- #
 
+def _explain_connect_error(exc: Exception, base_url: str) -> str:
+    """Turn a failure while logging in into a message that says what to do."""
+    text = str(exc)
+    if "Passphrase" in text:
+        return "Wrong key passphrase — try again."
+    if isinstance(exc, ssl.SSLError):
+        # httpx wraps handshake errors in ConnectError, so a bare SSLError comes
+        # from loading the CA bundle.
+        return f"The CA certificate could not be loaded — it must be a PEM file. Details: {text}"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"{base_url} did not respond in time — check the URL and your VPN or firewall."
+    if isinstance(exc, httpx.TransportError):
+        if "CERTIFICATE_VERIFY_FAILED" in text:
+            why = (
+                f"The TLS certificate of {base_url} is not trusted — provide your company "
+                "CA under \"CA cert\", or untick \"Verify TLS\" only if you trust this network."
+            )
+        elif "refused" in text.lower():
+            why = f"{base_url} refused the connection — check the host and port, and that the server is up."
+        elif any(s in text for s in ("nodename", "not known", "getaddrinfo", "name resolution")):
+            why = f"The server name in {base_url} could not be found — check the spelling and your VPN."
+        else:
+            why = f"Could not reach {base_url} — check the URL and your network."
+        return f"{why} Details: {text}"
+    traceback.print_exc()
+    return (
+        f"Unexpected error: {type(exc).__name__}: {text} "
+        "(full details are in the terminal running this tool)"
+    )
+
+
+def _check_private_key(private_key: str):
+    """Reject an unusable key file before contacting the server."""
+    try:
+        key, _ = PGPKey.from_blob(private_key)
+    except Exception as exc:
+        raise PassboltError(
+            f"The chosen key file is not a readable OpenPGP key — pick your private key "
+            f"(.asc, from the Passbolt recovery kit). Details: {exc}"
+        )
+    if key.is_public:
+        raise PassboltError(
+            "The chosen key file is a PUBLIC key — pick your private key "
+            "(.asc, from the Passbolt recovery kit)."
+        )
+
+
 def api_connect(payload: dict) -> dict:
     global _client
     verify: bool | str = bool(payload.get("verify", True))
@@ -108,15 +159,24 @@ def api_connect(payload: dict) -> dict:
 
     # Normalize to scheme://host[:port] — people paste full web-app URLs
     # like https://host/app/passwords, but the API lives at the origin.
-    parts = urlsplit((payload.get("base_url") or _defaults.get("base_url", "")).strip())
-    if not parts.scheme or not parts.netloc:
-        raise PassboltError(f"Invalid server URL: {payload['base_url']!r}")
+    raw_url = (payload.get("base_url") or _defaults.get("base_url", "")).strip()
+    if not raw_url:
+        raise PassboltError("Enter the server URL, e.g. https://passbolt.example.com")
+    parts = urlsplit(raw_url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise PassboltError(
+            f"Invalid server URL: {raw_url!r} — it must start with https://, "
+            "e.g. https://passbolt.example.com"
+        )
     base_url = f"{parts.scheme}://{parts.netloc}"
+    gpg_library = payload.get("gpg_library", "PGPy")
+    if gpg_library != "gnupg":
+        _check_private_key(private_key)
     config = {
         "base_url": base_url,
         "private_key": private_key,
         "passphrase": payload.get("passphrase", ""),
-        "gpg_library": payload.get("gpg_library", "PGPy"),
+        "gpg_library": gpg_library,
         "fingerprint": (payload.get("fingerprint") or _defaults.get("fingerprint", "")).strip(),
         "user_id": (payload.get("user_id") or _defaults.get("user_id", "")).strip(),
         "verify": verify,
@@ -126,9 +186,7 @@ def api_connect(payload: dict) -> dict:
     except PassboltError:
         raise
     except Exception as exc:
-        if "Passphrase" in str(exc):
-            raise PassboltError("Wrong key passphrase — try again.")
-        raise
+        raise PassboltError(_explain_connect_error(exc, base_url)) from exc
     if not client.authenticated or not client.user_id:
         raise PassboltError("Authentication failed — check key, passphrase and URL.")
     _client = client
@@ -918,6 +976,9 @@ PAGE = r"""<!DOCTYPE html>
   button.secondary:hover { background: var(--accent-soft); color: var(--accent);
     border-color: var(--accent); }
   button:disabled { opacity: .45; cursor: default; transform: none; }
+  #connError { margin: 9px 0 3px; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--err); color: var(--err); font-size: 13px;
+    white-space: pre-wrap; overflow-wrap: anywhere; }
   #connStatus { padding: 3px 12px; border-radius: 999px; font-size: 12px;
     border: 1px solid var(--border); background: var(--bg); color: var(--muted); }
   .tabcard { background: var(--card); border: 1px solid var(--border);
@@ -1006,6 +1067,7 @@ PAGE = r"""<!DOCTYPE html>
     <button id="btnConnect" onclick="connect()">Connect</button>
     <span id="connStatus" class="muted">not connected</span>
   </div>
+  <div id="connError" role="alert" hidden></div>
 </fieldset>
 
 <div class="tabcard">
@@ -1260,14 +1322,25 @@ function showTab(n) {
   }
 }
 
+function showConnError(msg) {
+  const box = document.getElementById("connError");
+  box.textContent = msg;
+  box.hidden = !msg;
+  if (msg) log("Connect failed: " + msg, "err");
+  const st = document.getElementById("connStatus");
+  st.style.color = msg ? "var(--err)" : "";
+  st.style.borderColor = msg ? "var(--err)" : "";
+}
+
 async function connect() {
   const btn = document.getElementById("btnConnect");
   const backend = document.getElementById("c_backend").value;
   if (backend === "PGPy" && !KEY_TEXT && !DEFAULTS.key_file) {
-    log("Choose your private key file first (or set key_file in credentials.json).", "err");
+    showConnError("Choose your private key file first (or set key_file in credentials.json).");
     return;
   }
   btn.disabled = true;
+  showConnError("");
   document.getElementById("connStatus").textContent = "connecting…";
   try {
     const r = await api("/api/connect", {
@@ -1293,7 +1366,10 @@ async function connect() {
     await loadData();
     enableAll();
   } catch (e) {
-    log("Connect failed: " + e.message, "err");
+    // fetch() itself rejects with a TypeError when this tool's server is gone.
+    showConnError(e instanceof TypeError
+      ? "This tool's local server is not responding — check that it is still running, then reload the page."
+      : e.message);
     document.getElementById("connStatus").textContent = "failed";
   } finally { btn.disabled = false; }
 }
